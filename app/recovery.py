@@ -9,8 +9,14 @@ Pipeline (exactly the three ARIES phases):
    image (pageLSN < update LSN).
 3. Undo      — loser transactions (no commit record by crash time) are
    rolled back in reverse-LSN order along each transaction's prevLSN
-   chain; a page is rewritten only when the page-LSN condition holds
-   (the page currently carries exactly the update being undone).
+   chain.  Every update is judged by its own interval bytes: an after
+   image whose presence on the page is vouched for (by the crashed
+   image's pageLSN or by this recovery's redo) is rolled back to the
+   before image — even when a later, non-overlapping update on the
+   same page has moved the pageLSN past it; bytes already equal to the
+   before image are left alone; bytes matching neither image (e.g. a
+   later committed update overwrote the loser's bytes) make the
+   history untrustworthy and are stably rejected.
 
 Only record types begin/update/commit/abort/end/checkpoint are accepted.
 Every update carries its transaction predecessor (prevLSN), page number,
@@ -62,6 +68,11 @@ class PageState:
     page_lsn: Optional[int]
     initial_lsn: Optional[int]
     initial_sha: str
+    # Update LSNs whose after-image presence on the in-memory page is
+    # vouched for: either the crashed image's pageLSN covers them, or this
+    # recovery's redo applied/confirmed them.  Undo may roll back only a
+    # verified after-image.
+    verified: set[int] = field(default_factory=set)
 
 
 def _hex_to_bytes(value: Any, field_name: str, expected_len: Optional[int] = None) -> bytes:
@@ -387,6 +398,17 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
     cp = checkpoints[0] if checkpoints else None
     _validate_chain(records, by_lsn, cp)
 
+    # Provenance seed: a crashed image's pageLSN vouches for every update
+    # on that page with LSN <= pageLSN (the pageLSN contract).  Redo adds
+    # the updates it applies itself; undo may roll back only a vouched
+    # after-image.
+    for rec in records:
+        if rec.kind != "update":
+            continue
+        st = pages.get(rec.page)
+        if st is not None and st.initial_lsn is not None and rec.lsn <= st.initial_lsn:
+            st.verified.add(rec.lsn)
+
     trace: list[dict[str, Any]] = []
 
     # ================= ANALYSIS ==========================================
@@ -516,6 +538,7 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
         interval = bytes(st.data[rec.offset : rec.offset + rec.length])
 
         if already:
+            st.verified.add(rec.lsn)
             criterion = (
                 f"重做判据：pageLSN={before_lsn} ≥ LSN {rec.lsn} → "
                 "该更新已落盘，不重做"
@@ -532,6 +555,7 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
         elif interval == rec.before:
             st.data[rec.offset : rec.offset + rec.length] = rec.after
             st.page_lsn = rec.lsn
+            st.verified.add(rec.lsn)
             changed = True
             redone += 1
             criterion = (
@@ -640,7 +664,15 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
 
         st = current_page(rec.page)
         before_lsn = st.page_lsn
-        if st.page_lsn is not None and st.page_lsn > rec.lsn:
+        interval = bytes(st.data[rec.offset : rec.offset + rec.length])
+
+        # Judge the update by its own interval bytes, not by the pageLSN
+        # alone: a later update to a *disjoint* interval of the same page
+        # moves the pageLSN past this LSN without touching these bytes.
+        if interval == rec.before:
+            # The after-image is already gone from this interval (a later
+            # page version or an already-processed undo restored it): the
+            # rollback is a no-op here.
             trace.append(
                 {
                     "phase": "undo",
@@ -649,10 +681,10 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
                     "xid": rec.xid,
                     "page": rec.page,
                     "criterion": (
-                        f"撤销判据：pageLSN={st.page_lsn} 晚于撤销 LSN {rec.lsn} "
-                        "→ 认为该更新已被后续页版本覆盖"
+                        f"撤销判据：区间 [{rec.offset},{rec.offset + rec.length}) "
+                        "当前字节已等于 before 镜像 → 该更新已不在页上"
                     ),
-                    "decision": "跳过页回写，继续沿失败事务前驱链回溯",
+                    "decision": "跳过：无需回写，继续沿失败事务前驱链回溯",
                     "pageLSNBefore": before_lsn,
                     "pageLSNAfter": st.page_lsn,
                     "changed": False,
@@ -660,49 +692,71 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
                     "length": rec.length,
                 }
             )
-            if rec.prev_lsn is not None:
-                undo_stack.append(rec.prev_lsn)
-                undo_stack.sort(reverse=True)
-            continue
-        if st.page_lsn != rec.lsn:
-            raise RecoveryError(
-                f"撤销 LSN {rec.lsn}（事务 {rec.xid}，页 {rec.page}）时页 LSN 条件不满足："
-                f"当前 pageLSN={st.page_lsn}，期望 {rec.lsn}（只在条件满足时改写页像）"
-            )
-        interval = bytes(st.data[rec.offset : rec.offset + rec.length])
-        if interval != rec.after:
+        elif interval != rec.after:
+            # Neither image matches: a later committed update (fully or
+            # partially) overwrote these bytes.  Rolling back would clobber
+            # committed data, keeping them would retain uncommitted bytes —
+            # no trustworthy recovery conclusion exists.
             raise RecoveryError(
                 f"撤销 LSN {rec.lsn}（事务 {rec.xid}，页 {rec.page}）时，"
-                f"区间 [{rec.offset},{rec.offset + rec.length}) 当前字节不是 after 镜像"
-                " —— 错误前像，稳定拒绝"
+                f"区间 [{rec.offset},{rec.offset + rec.length}) 当前字节既非 after "
+                "也非 before 镜像（疑似被后续已提交更新覆盖）—— 错误前像，稳定拒绝"
             )
-        st.data[rec.offset : rec.offset + rec.length] = rec.before
-        st.page_lsn = rec.prev_lsn if rec.prev_lsn else None
-        undone += 1
-        trace.append(
-            {
-                "phase": "undo",
-                "lsn": rec.lsn,
-                "type": "update",
-                "xid": rec.xid,
-                "page": rec.page,
-                "criterion": (
+        elif rec.lsn not in st.verified:
+            # The after-image sits on the page, but its presence is
+            # unexplainable: neither the crashed image's pageLSN nor this
+            # recovery's redo vouches for it.
+            raise RecoveryError(
+                f"撤销 LSN {rec.lsn}（事务 {rec.xid}，页 {rec.page}）时页 LSN 条件不满足："
+                f"after 镜像在页上，但崩溃页像 pageLSN={st.initial_lsn} 未涵盖该更新，"
+                "本次重做也未写入 —— 只在条件满足时改写页像，稳定拒绝"
+            )
+        else:
+            # Verified after-image: roll it back.  If the pageLSN has moved
+            # past this LSN, later updates exist on the page; the interval
+            # check above proves they did not touch these bytes, so the
+            # rollback cannot clobber them and the higher pageLSN stands.
+            st.data[rec.offset : rec.offset + rec.length] = rec.before
+            st.verified.discard(rec.lsn)
+            undone += 1
+            if st.page_lsn is not None and st.page_lsn > rec.lsn:
+                criterion = (
+                    f"撤销判据：pageLSN={before_lsn} 晚于撤销 LSN {rec.lsn}，但区间字节"
+                    "仍为 after 镜像（更晚更新未覆盖该区间）→ 回写 before"
+                )
+                decision = (
+                    f"撤销 [{rec.offset},{rec.offset + rec.length})：after→before；"
+                    f"页上仍保留更晚更新，pageLSN 保持 {st.page_lsn}，下一跳 {rec.prev_lsn}"
+                )
+            else:
+                st.page_lsn = rec.prev_lsn
+                criterion = (
                     f"撤销判据：pageLSN={before_lsn} == 撤销 LSN {rec.lsn} "
                     "→ 页 LSN 条件满足，逆序沿 prevLSN 链回写 before"
-                ),
-                "decision": (
+                )
+                decision = (
                     f"撤销 [{rec.offset},{rec.offset + rec.length})：after→before，"
                     f"pageLSN {before_lsn}→{rec.prev_lsn}，下一跳 {rec.prev_lsn}"
-                ),
-                "pageLSNBefore": before_lsn,
-                "pageLSNAfter": st.page_lsn,
-                "changed": True,
-                "offset": rec.offset,
-                "length": rec.length,
-            }
-        )
-        undo_stack.append(rec.prev_lsn)
-        undo_stack.sort(reverse=True)
+                )
+            trace.append(
+                {
+                    "phase": "undo",
+                    "lsn": rec.lsn,
+                    "type": "update",
+                    "xid": rec.xid,
+                    "page": rec.page,
+                    "criterion": criterion,
+                    "decision": decision,
+                    "pageLSNBefore": before_lsn,
+                    "pageLSNAfter": st.page_lsn,
+                    "changed": True,
+                    "offset": rec.offset,
+                    "length": rec.length,
+                }
+            )
+        if rec.prev_lsn is not None:
+            undo_stack.append(rec.prev_lsn)
+            undo_stack.sort(reverse=True)
 
     # ================= frozen verdict ====================================
     page_summary = []

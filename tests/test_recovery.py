@@ -4,6 +4,7 @@ Run: python -m unittest -v tests.test_recovery
 (no third-party dependencies)
 """
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -163,6 +164,183 @@ class LoserUndoTests(unittest.TestCase):
         self.assertEqual(v["loserTransactions"], ["T9"])
         self.assertEqual(v["undone"], 1)
         self.assertTrue(v["pages"][0]["data"].startswith("0000"))
+
+
+class SamePageInterleavingTests(unittest.TestCase):
+    """Several transactions interleaving updates on the *same* page.
+
+    The frozen page must keep committed bytes and drop loser bytes
+    interval by interval, and the frozen summary (data / pageLSN /
+    SHA-256) must stay consistent with the per-record evidence.
+    """
+
+    @staticmethod
+    def _sha(data_hex):
+        return hashlib.sha256(bytes.fromhex(data_hex)).hexdigest()
+
+    def test_loser_then_committed_disjoint_intervals(self):
+        # 事务甲 (loser) writes [0,4); 事务乙 (committed) writes the
+        # disjoint [8,12); the crashed image carries neither update.
+        wal = [
+            begin(10, "TA"),
+            upd(20, "TA", 10, 1, 0, "00000000", "aaaaaaaa"),
+            begin(30, "TB"),
+            upd(40, "TB", 30, 1, 8, "00000000", "bbbbbbbb"),
+            commit(50, "TB", 40),
+            end(60, "TB", 50),
+        ]
+        v = run("loser-then-committed", [page(1, ZEROS, page_lsn=5)], wal)
+
+        self.assertEqual(v["committedTransactions"], ["TB"])
+        self.assertEqual(v["loserTransactions"], ["TA"])
+        self.assertEqual(v["redone"], 2)   # both updates were missing
+        self.assertEqual(v["undone"], 1)   # TA's update rolled back
+
+        summary = v["pages"][0]
+        data = summary["data"]
+        # Loser bytes are gone; committed bytes survive.
+        self.assertEqual(data[0:8], "00000000")
+        self.assertEqual(data[16:24], "bbbbbbbb")
+        # Page data, summary and SHA-256 are mutually consistent.
+        self.assertEqual(summary["sha256After"], self._sha(data))
+        self.assertEqual(summary["pageLSNBefore"], 5)
+        # The committed LSN-40 update is the newest one left on the page.
+        self.assertEqual(summary["pageLSNAfter"], 40)
+        self.assertTrue(summary["changed"])
+
+        # The per-record evidence shows TA's update was rolled back.
+        undo_rows = [t for t in v["trace"]
+                     if t["phase"] == "undo" and t["type"] == "update"]
+        self.assertEqual([t["lsn"] for t in undo_rows], [20])
+        self.assertTrue(undo_rows[0]["changed"])
+        self.assertEqual(undo_rows[0]["pageLSNAfter"], 40)
+
+    def test_multiple_interleaved_losers_same_page(self):
+        # Two losers interleave disjoint updates on one page; every loser
+        # update is rolled back even after undoing the newest one moves
+        # the pageLSN back below the other loser's LSN.
+        wal = [
+            begin(10, "TA"),
+            begin(15, "TB"),
+            upd(20, "TA", 10, 1, 0, "00000000", "aaaaaaaa"),
+            upd(40, "TB", 15, 1, 16, "00000000", "cccccccc"),
+            upd(50, "TA", 20, 1, 8, "00000000", "bbbbbbbb"),
+        ]
+        v = run("two-losers", [page(1, ZEROS, page_lsn=5)], wal)
+
+        self.assertEqual(sorted(v["loserTransactions"]), ["TA", "TB"])
+        self.assertEqual(v["redone"], 3)
+        self.assertEqual(v["undone"], 3)
+        summary = v["pages"][0]
+        self.assertEqual(summary["data"], ZEROS)
+        self.assertFalse(summary["changed"])
+        self.assertEqual(summary["sha256After"], self._sha(ZEROS))
+        undo_lsns = [t["lsn"] for t in v["trace"]
+                     if t["phase"] == "undo" and t["type"] == "update"]
+        self.assertEqual(undo_lsns, [50, 40, 20])
+
+    def test_loser_committed_loser_committed_interleaved(self):
+        # Committed and loser updates alternate on one page (disjoint
+        # intervals): both loser updates roll back, both committed
+        # updates survive.
+        wal = [
+            begin(10, "TL1"),
+            upd(20, "TL1", 10, 1, 0, "0000", "aaaa"),
+            begin(25, "TC1"),
+            upd(30, "TC1", 25, 1, 4, "0000", "bbbb"),
+            commit(35, "TC1", 30),
+            end(36, "TC1", 35),
+            begin(40, "TL2"),
+            upd(45, "TL2", 40, 1, 8, "0000", "cccc"),
+            begin(50, "TC2"),
+            upd(55, "TC2", 50, 1, 12, "0000", "dddd"),
+            commit(60, "TC2", 55),
+            end(65, "TC2", 60),
+        ]
+        v = run("interleaved-4", [page(1, ZEROS, page_lsn=5)], wal)
+
+        self.assertEqual(sorted(v["loserTransactions"]), ["TL1", "TL2"])
+        self.assertEqual(v["redone"], 4)
+        self.assertEqual(v["undone"], 2)
+        summary = v["pages"][0]
+        data = summary["data"]
+        self.assertEqual(data[0:4], "0000")    # TL1 rolled back
+        self.assertEqual(data[8:12], "bbbb")   # TC1 kept
+        self.assertEqual(data[16:20], "0000")  # TL2 rolled back
+        self.assertEqual(data[24:28], "dddd")  # TC2 kept
+        self.assertEqual(summary["sha256After"], self._sha(data))
+        # The newest surviving update is TC2's LSN 55.
+        self.assertEqual(summary["pageLSNAfter"], 55)
+
+    def test_committed_overwrite_of_loser_interval_rejected(self):
+        # A committed update overwrote the loser's bytes — a history that
+        # cannot occur under strict 2PL.  No trustworthy undo exists.
+        wal = [
+            begin(10, "TA"),
+            upd(20, "TA", 10, 1, 0, "00000000", "aaaaaaaa"),
+            begin(30, "TB"),
+            upd(40, "TB", 30, 1, 0, "aaaaaaaa", "bbbbbbbb"),
+            commit(50, "TB", 40),
+            end(60, "TB", 50),
+        ]
+        with self.assertRaises(RecoveryError) as ctx:
+            run("committed-overwrite", [page(1, ZEROS, page_lsn=5)], wal)
+        self.assertIn("错误前像", str(ctx.exception))
+
+    def test_committed_partial_overlap_of_loser_interval_rejected(self):
+        # Partial overlap: undoing the loser would clobber half of the
+        # committed update; keeping it would retain loser bytes.
+        wal = [
+            begin(10, "TA"),
+            upd(20, "TA", 10, 1, 0, "00000000" * 2, "aaaaaaaa" * 2),
+            begin(30, "TB"),
+            upd(40, "TB", 30, 1, 4, "aaaaaaaa" + "00000000", "bbbbbbbb" * 2),
+            commit(50, "TB", 40),
+            end(60, "TB", 50),
+        ]
+        with self.assertRaises(RecoveryError) as ctx:
+            run("partial-overlap", [page(1, ZEROS, page_lsn=5)], wal)
+        self.assertIn("错误前像", str(ctx.exception))
+
+    def test_loser_over_committed_same_interval_restores_committed(self):
+        # Legitimate overlap: the loser wrote *after* the committed
+        # transaction on the same interval, so its before-image holds the
+        # committed bytes and undo restores exactly them.
+        wal = [
+            begin(10, "TB"),
+            upd(20, "TB", 10, 1, 0, "00000000", "bbbbbbbb"),
+            commit(30, "TB", 20),
+            end(40, "TB", 30),
+            begin(50, "TA"),
+            upd(60, "TA", 50, 1, 0, "bbbbbbbb", "aaaaaaaa"),
+        ]
+        v = run("loser-over-committed", [page(1, ZEROS, page_lsn=5)], wal)
+
+        self.assertEqual(v["loserTransactions"], ["TA"])
+        self.assertEqual(v["undone"], 1)
+        summary = v["pages"][0]
+        self.assertEqual(summary["data"][0:8], "bbbbbbbb")
+        self.assertEqual(summary["sha256After"], self._sha(summary["data"]))
+
+    def test_flushed_loser_update_on_crashed_image_is_undone(self):
+        # The loser's update had already reached the crashed page image
+        # (pageLSN covers it): still rolled back, committed neighbour kept.
+        wal = [
+            begin(10, "TA"),
+            upd(20, "TA", 10, 1, 0, "00000000", "aaaaaaaa"),
+            begin(30, "TB"),
+            upd(40, "TB", 30, 1, 8, "00000000", "bbbbbbbb"),
+            commit(50, "TB", 40),
+            end(60, "TB", 50),
+        ]
+        # Image carries TA's LSN-20 update (pageLSN 20) but not TB's.
+        v = run("flushed-loser",
+                [page(1, zeros_with(0, "aaaaaaaa"), page_lsn=20)], wal)
+        self.assertEqual(v["redone"], 1)   # only TB's LSN-40 update
+        self.assertEqual(v["undone"], 1)
+        data = v["pages"][0]["data"]
+        self.assertEqual(data[0:8], "00000000")
+        self.assertEqual(data[16:24], "bbbbbbbb")
 
 
 class AnalysisTests(unittest.TestCase):

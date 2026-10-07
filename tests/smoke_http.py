@@ -154,6 +154,57 @@ def run_checks(base: str, managed_proc, managed_tmp) -> int:
         check("loser bytes rolled back", p7["data"][32:40] == "00" * 4)
         check("committed T1 bytes remain", p7["data"].startswith("11" * 16))
 
+        # 6.5 same page, loser writes first / committed writes later,
+        #     disjoint intervals: loser bytes must vanish, committed
+        #     bytes must survive, and the frozen summary must be readable
+        mixed = {
+            "auditId": "SMOKE-MIXED",
+            "pages": [{"page": 5, "pageLSN": 5, "data": Z}],
+            "wal": [
+                {"lsn": 10, "type": "begin", "xid": "TL"},
+                {"lsn": 20, "type": "update", "xid": "TL", "prevLSN": 10,
+                 "page": 5, "offset": 0, "before": "00000000", "after": "deadbeef"},
+                {"lsn": 30, "type": "begin", "xid": "TC"},
+                {"lsn": 40, "type": "update", "xid": "TC", "prevLSN": 30,
+                 "page": 5, "offset": 16, "before": "00000000", "after": "cafebabe"},
+                {"lsn": 50, "type": "commit", "xid": "TC", "prevLSN": 40},
+                {"lsn": 60, "type": "end", "xid": "TC", "prevLSN": 50},
+            ],
+        }
+        status, payload = request("POST", f"{base}/api/recover", mixed, expect=200)
+        v = payload["verdict"]
+        check("loser-first committed-later accepted", payload["status"] == "accepted")
+        check("mixed loser identified", v["loserTransactions"] == ["TL"])
+        check("mixed loser update undone", v["redone"] == 2 and v["undone"] == 1)
+        p5 = v["pages"][0]
+        check("loser bytes gone from final page", p5["data"][0:8] == "00000000")
+        check("committed bytes kept on final page", p5["data"][32:40] == "cafebabe")
+        check("mixed summary sha256 frozen", len(p5["sha256After"]) == 64)
+        undo_rows = [t for t in v["trace"] if t["phase"] == "undo" and t["type"] == "update"]
+        check("undo evidence recorded", len(undo_rows) == 1 and undo_rows[0]["changed"])
+
+        # frozen page summary readable via the stable audit id
+        status, payload = request("GET", f"{base}/api/audit?auditId=SMOKE-MIXED")
+        check("frozen mixed verdict readable",
+              status == 200 and payload["status"] == "accepted")
+        fp = payload["verdict"]["pages"][0]
+        check("frozen summary matches final page",
+              fp["data"][0:8] == "00000000" and fp["data"][32:40] == "cafebabe")
+
+        # 6.6 same audit id, now an untrustworthy history (the committed
+        #     update overwrote the loser's bytes) -> stable 422 and the
+        #     earlier success evidence is cleared
+        overwritten = json.loads(json.dumps(mixed))
+        overwritten["wal"][3]["offset"] = 0
+        overwritten["wal"][3]["before"] = "deadbeef"
+        status, payload = request("POST", f"{base}/api/recover", overwritten, expect=422)
+        check("committed-overwrite history rejected 422",
+              status == 422 and payload["status"] == "rejected")
+        status, payload = request("GET", f"{base}/api/audit?auditId=SMOKE-MIXED")
+        check("prior mixed success evidence cleared",
+              status == 200 and payload["status"] == "rejected"
+              and "verdict" not in payload)
+
         # 7. corrupted predecessor chain -> stable rejection
         corrupted = json.loads(json.dumps(committed))
         corrupted["auditId"] = "SMOKE-REJECT"
