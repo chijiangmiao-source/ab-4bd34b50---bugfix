@@ -92,6 +92,20 @@ function renderTrace(trace) {
       : (t.type === "redo-start" || t.type === "undo-start" || t.type === "checkpoint")
         ? ""
         : '<span class="pill unchanged">未写页</span>';
+    let byteEvidence = "";
+    if (t.phase === "undo" && t.type === "update") {
+      const bits = [];
+      if (typeof t.restoredBytes === "number" && t.restoredBytes > 0) {
+        bits.push(`<span class="pill altered">回写 ${t.restoredBytes}B</span>`);
+      }
+      if (typeof t.committedBytesKept === "number" && t.committedBytesKept > 0) {
+        bits.push(`<span class="pill winner">保留已提交 ${t.committedBytesKept}B</span>`);
+      }
+      if (typeof t.alreadyBeforeBytes === "number" && t.alreadyBeforeBytes > 0) {
+        bits.push(`<span class="pill unchanged">已是 before ${t.alreadyBeforeBytes}B</span>`);
+      }
+      byteEvidence = bits.length ? `<div style="margin-top:4px">${bits.join(" ")}</div>` : "";
+    }
     tr.innerHTML = `
       <td><span class="pill ${t.phase}">${t.phase}</span></td>
       <td class="monospace">${lsn(t.lsn)}</td>
@@ -99,7 +113,7 @@ function renderTrace(trace) {
       <td>${esc(t.xid || "—")}</td>
       <td class="monospace">${lsn(t.page)}</td>
       <td style="max-width:430px">${esc(t.criterion)}</td>
-      <td style="max-width:430px">${esc(t.decision)}</td>
+      <td style="max-width:430px">${esc(t.decision)}${byteEvidence}</td>
       <td class="monospace">${lsn(t.pageLSNBefore)}</td>
       <td class="monospace">${lsn(t.pageLSNAfter)}</td>`;
     els.traceBody.appendChild(tr);

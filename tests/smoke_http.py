@@ -154,7 +154,79 @@ def run_checks(base: str, managed_proc, managed_tmp) -> int:
         check("loser bytes rolled back", p7["data"][32:40] == "00" * 4)
         check("committed T1 bytes remain", p7["data"].startswith("11" * 16))
 
-        # 7. corrupted predecessor chain -> stable rejection
+        # 7. same-page interleaving: loser writes first (uncommitted),
+        #    winner writes a NON-overlapping interval later and commits.
+        #    Crashed image contains NEITHER update.  After recovery the
+        #    loser bytes must be gone while the committed bytes survive.
+        interleave = {
+            "auditId": "SMOKE-INTERLEAVE",
+            "pages": [{"page": 3, "pageLSN": 10, "data": Z}],
+            "wal": [
+                {"lsn": 10, "type": "begin", "xid": "TBAD"},
+                {"lsn": 20, "type": "update", "xid": "TBAD", "prevLSN": 10,
+                 "page": 3, "offset": 0,
+                 "before": "00000000", "after": "deadbeef"},
+                {"lsn": 30, "type": "begin", "xid": "TGOOD"},
+                {"lsn": 40, "type": "update", "xid": "TGOOD", "prevLSN": 30,
+                 "page": 3, "offset": 8,
+                 "before": "0000000000000000", "after": "1122334455667788"},
+                {"lsn": 50, "type": "commit", "xid": "TGOOD", "prevLSN": 40},
+                {"lsn": 60, "type": "end", "xid": "TGOOD", "prevLSN": 50},
+            ],
+        }
+        status, payload = request("POST", f"{base}/api/recover", interleave, expect=200)
+        v = payload["verdict"]
+        check("interleave accepted", payload["status"] == "accepted")
+        check("interleave loser identified", v["loserTransactions"] == ["TBAD"])
+        check("interleave committed identified",
+              v["committedTransactions"] == ["TGOOD"])
+        p3 = next(p for p in v["pages"] if p["page"] == 3)
+        p3bytes = bytes.fromhex(p3["data"])
+        check("loser bytes removed", p3bytes[0:4] == b"\x00" * 4)
+        check("committed bytes retained",
+              p3bytes[8:16] == bytes.fromhex("1122334455667788"))
+        check("loser bytes absent elsewhere",
+              bytes.fromhex("deadbeef") not in p3bytes)
+        undo_rows = [t for t in v["trace"]
+                     if t["phase"] == "undo" and t["type"] == "update"]
+        check("undo evidence for loser present",
+              len(undo_rows) == 1 and undo_rows[0]["xid"] == "TBAD"
+              and undo_rows[0]["restoredBytes"] == 4
+              and undo_rows[0]["committedBytesKept"] == 0)
+
+        # 7b. frozen verdict + page summary readable afterwards
+        status, frozen = request(
+            "GET", f"{base}/api/audit?auditId=SMOKE-INTERLEAVE")
+        check("interleave frozen verdict readable",
+              status == 200 and frozen["status"] == "accepted")
+        fv = frozen.get("verdict", {})
+        fp3 = next((p for p in fv.get("pages", []) if p["page"] == 3), None)
+        check("frozen page summary readable",
+              fp3 is not None and len(fp3["sha256After"]) == 64
+              and fp3["data"] == p3["data"])
+        check("frozen per-record evidence retained",
+              any(t.get("phase") == "undo" for t in fv.get("trace", [])))
+
+        # 7c. same scenario id with an untrustworthy before-image chain
+        # (loser interval holds garbage while pageLSN already covers it):
+        # stable 422 and the EARLIER accepted evidence must be cleared.
+        corrupt_interleave = json.loads(json.dumps(interleave))
+        bad_img = bytearray(4096)
+        bad_img[0:4] = bytes.fromhex("ffffffff")
+        bad_img[8:16] = bytes.fromhex("1122334455667788")
+        corrupt_interleave["pages"][0] = {
+            "page": 3, "pageLSN": 60, "data": bytes(bad_img).hex(),
+        }
+        status, payload = request(
+            "POST", f"{base}/api/recover", corrupt_interleave, expect=422)
+        check("interleave corrupt chain rejected 422",
+              status == 422 and "前像链异常" in payload["error"])
+        status, payload = request(
+            "GET", f"{base}/api/audit?auditId=SMOKE-INTERLEAVE")
+        check("corruption cleared prior interleave success evidence",
+              payload["status"] == "rejected" and "verdict" not in payload)
+
+        # 8. corrupted predecessor chain -> stable rejection
         corrupted = json.loads(json.dumps(committed))
         corrupted["auditId"] = "SMOKE-REJECT"
         corrupted["wal"][1]["prevLSN"] = 999
@@ -163,7 +235,7 @@ def run_checks(base: str, managed_proc, managed_tmp) -> int:
         status, payload = request("GET", f"{base}/api/audit?auditId=SMOKE-REJECT")
         check("rejection frozen as rejected", payload["status"] == "rejected")
 
-        # 8. rejection of same audit id CLEARS earlier success evidence
+        # 9. rejection of a different audit id CLEARS its earlier success
         status, payload = request("POST", f"{base}/api/recover", committed, expect=200)
         check("baseline success stored", payload["status"] == "accepted")
         corrupted2 = json.loads(json.dumps(committed))

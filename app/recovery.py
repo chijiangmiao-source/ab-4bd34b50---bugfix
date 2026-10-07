@@ -9,8 +9,12 @@ Pipeline (exactly the three ARIES phases):
    image (pageLSN < update LSN).
 3. Undo      — loser transactions (no commit record by crash time) are
    rolled back in reverse-LSN order along each transaction's prevLSN
-   chain; a page is rewritten only when the page-LSN condition holds
-   (the page currently carries exactly the update being undone).
+   chain.  Rewrites are interval/byte-level (not whole-page): the loser
+   update's before-image is restored only where a *committed* transaction
+   has not since overwritten the bytes.  Positions later touched by a
+   committed update keep that committed after-image, so interleaved
+   writes of losers and winners on the same page never leak uncommitted
+   bytes nor erase committed ones.
 
 Only record types begin/update/commit/abort/end/checkpoint are accepted.
 Every update carries its transaction predecessor (prevLSN), page number,
@@ -62,6 +66,10 @@ class PageState:
     page_lsn: Optional[int]
     initial_lsn: Optional[int]
     initial_sha: str
+    # Byte offsets finalized by a committed transaction (updates of xacts
+    # that have a commit record in the WAL).  Undo must never restore a
+    # before-image at these positions — committed visibility wins.
+    committed_offsets: set[int] = field(default_factory=set)
 
 
 def _hex_to_bytes(value: Any, field_name: str, expected_len: Optional[int] = None) -> bytes:
@@ -387,6 +395,18 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
     cp = checkpoints[0] if checkpoints else None
     _validate_chain(records, by_lsn, cp)
 
+    # Transactions whose commit is durable in the WAL window.  Their
+    # updates are winner writes: their bytes are finalized wherever the
+    # current page image actually carries that after-image, and must
+    # survive loser undo even when a loser wrote the same page (or the
+    # same positions) first.  Protection is computed byte-wise after redo
+    # (not merely by offset), because a later loser update may itself have
+    # overwritten those bytes and still needs to be undone.
+    committed_xids: set[str] = {r.xid for r in records if r.kind == "commit"}
+    committed_updates = [
+        r for r in records if r.kind == "update" and r.xid in committed_xids
+    ]
+
     trace: list[dict[str, Any]] = []
 
     # ================= ANALYSIS ==========================================
@@ -573,6 +593,27 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
     # reported in the frozen verdict).
     dpt.clear()
 
+    # ---- protect committed (winner) bytes, byte-accurately --------------
+    # A byte is finalized only where the post-redo page image actually
+    # carries a committed update's after-image.  Matching bytes (not just
+    # WAL offsets) is essential: a later *loser* update that overwrote a
+    # winner's positions must stay unprotected so its own undo can restore
+    # the earlier (committed) bytes.
+    winner_by_page: dict[int, list[Record]] = {}
+    for rec in committed_updates:
+        winner_by_page.setdefault(rec.page, []).append(rec)
+
+    def reprotect(st: PageState) -> None:
+        """Re-scan committed updates against the current page image and
+        protect every interval whose after-image is now fully present."""
+        for rec in winner_by_page.get(st.page_no, ()):
+            lo, hi = rec.offset, rec.offset + rec.length
+            if bytes(st.data[lo:hi]) == rec.after:
+                st.committed_offsets.update(range(lo, hi))
+
+    for st in pages.values():
+        reprotect(st)
+
     # ARIES undo list: highest LSN first across all loser chains.
     undo_stack = sorted(
         (e["lastLSN"] for e in losers.values() if e["lastLSN"] is not None),
@@ -640,45 +681,97 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
 
         st = current_page(rec.page)
         before_lsn = st.page_lsn
-        if st.page_lsn is not None and st.page_lsn > rec.lsn:
-            trace.append(
-                {
-                    "phase": "undo",
-                    "lsn": rec.lsn,
-                    "type": rec.kind,
-                    "xid": rec.xid,
-                    "page": rec.page,
-                    "criterion": (
-                        f"撤销判据：pageLSN={st.page_lsn} 晚于撤销 LSN {rec.lsn} "
-                        "→ 认为该更新已被后续页版本覆盖"
-                    ),
-                    "decision": "跳过页回写，继续沿失败事务前驱链回溯",
-                    "pageLSNBefore": before_lsn,
-                    "pageLSNAfter": st.page_lsn,
-                    "changed": False,
-                    "offset": rec.offset,
-                    "length": rec.length,
-                }
-            )
-            if rec.prev_lsn is not None:
-                undo_stack.append(rec.prev_lsn)
-                undo_stack.sort(reverse=True)
-            continue
-        if st.page_lsn != rec.lsn:
-            raise RecoveryError(
-                f"撤销 LSN {rec.lsn}（事务 {rec.xid}，页 {rec.page}）时页 LSN 条件不满足："
-                f"当前 pageLSN={st.page_lsn}，期望 {rec.lsn}（只在条件满足时改写页像）"
-            )
-        interval = bytes(st.data[rec.offset : rec.offset + rec.length])
-        if interval != rec.after:
-            raise RecoveryError(
-                f"撤销 LSN {rec.lsn}（事务 {rec.xid}，页 {rec.page}）时，"
-                f"区间 [{rec.offset},{rec.offset + rec.length}) 当前字节不是 after 镜像"
-                " —— 错误前像，稳定拒绝"
-            )
-        st.data[rec.offset : rec.offset + rec.length] = rec.before
-        st.page_lsn = rec.prev_lsn if rec.prev_lsn else None
-        undone += 1
+        lo, hi = rec.offset, rec.offset + rec.length
+        current = bytes(st.data[lo:hi])
+
+        # Interval-level undo (a single scalar pageLSN cannot arbitrate
+        # between interleaved transactions on the same page).  Every byte
+        # position is classified independently:
+        #   * finalized by a later COMMITTED write  -> keep it untouched;
+        #   * currently holds this loser's after    -> restore before;
+        #   * already holds this record's before     -> idempotent no-op
+        #     (the effect is absent, e.g. the crashed pageLSN already
+        #     moved past this record without carrying its bytes);
+        #   * anything else                          -> corrupt before-image
+        #     chain: no trustworthy verdict exists.
+        free = [i for i in range(lo, hi) if i not in st.committed_offsets]
+        kept = (hi - lo) - len(free)
+        restore: list[int] = []
+        idempotent = 0
+        for i in free:
+            j = i - lo
+            if current[j] == rec.after[j]:
+                restore.append(i)
+            elif current[j] == rec.before[j]:
+                idempotent += 1
+            else:
+                raise RecoveryError(
+                    f"撤销 LSN {rec.lsn}（事务 {rec.xid}，页 {rec.page}）时，"
+                    f"区间 [{rec.offset},{rec.offset + rec.length}) 中未被已提交事务"
+                    "覆盖的位置当前字节既非该更新的 after 也非 before"
+                    " —— 前像链异常，无法形成可信恢复结论，稳定拒绝"
+                )
+
+        next_hop = rec.prev_lsn
+        if not restore:
+            # Nothing of this loser update still needs rolling back: the
+            # interval is either committed-covered or already at before.
+            if not free:
+                criterion = (
+                    f"撤销判据（区间级）：[{lo},{hi}) 全部 {hi - lo} 字节已被"
+                    "后续已提交事务的写入覆盖并冻结"
+                )
+                decision = "跳过页回写：保留已提交字节，继续沿 prevLSN 链回溯"
+            else:
+                criterion = (
+                    f"撤销判据（区间级）：pageLSN={'无' if before_lsn is None else before_lsn}"
+                    f"，[{lo},{hi}) 中未冻结的 {len(free)} 字节已等于 before"
+                    "（更新未落盘）→ 幂等不写页"
+                )
+                decision = "跳过：区间已是 before 镜像"
+            changed = False
+        else:
+            # Restore the before-image exactly on the after-bearing,
+            # unprotected positions; committed/idempotent bytes are kept.
+            for i in restore:
+                st.data[i] = rec.before[i - lo]
+            # Roll back the page version only in the classic single-chain
+            # case.  With committed/interleaved bytes retained the page
+            # still carries a later version, so the scalar pageLSN stands.
+            if kept == 0 and idempotent == 0 and st.page_lsn == rec.lsn:
+                st.page_lsn = rec.prev_lsn if rec.prev_lsn else None
+            undone += 1
+            changed = True
+            parts = []
+            if kept:
+                parts.append(f"{kept} 字节已被后续已提交事务覆盖（保留）")
+            if idempotent:
+                parts.append(f"{idempotent} 字节已是 before（幂等跳过）")
+            tail = "，".join(parts)
+            if tail:
+                criterion = (
+                    f"撤销判据（区间级）：[{lo},{hi}) 中 {len(restore)} 字节仍为"
+                    f" LSN {rec.lsn} 的 after（回写 before）；{tail}"
+                )
+                decision = (
+                    f"部分撤销 [{lo},{hi})：{len(restore)} 字节 after→before，"
+                    f"下一跳 {next_hop}"
+                )
+            else:
+                criterion = (
+                    f"撤销判据（区间级）：[{lo},{hi}) {hi - lo} 字节均为"
+                    f" LSN {rec.lsn} 的 after 镜像且无已提交覆盖 → 逆序沿 "
+                    "prevLSN 链回写 before"
+                )
+                decision = (
+                    f"撤销 [{lo},{hi})：after→before，"
+                    f"pageLSN {before_lsn}→{st.page_lsn}，下一跳 {next_hop}"
+                )
+            # The restored bytes may re-materialize an earlier committed
+            # after-image (a later loser had overwritten it): re-protect so
+            # earlier loser undo steps cannot erase those committed bytes.
+            reprotect(st)
+
         trace.append(
             {
                 "phase": "undo",
@@ -686,25 +779,50 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
                 "type": "update",
                 "xid": rec.xid,
                 "page": rec.page,
-                "criterion": (
-                    f"撤销判据：pageLSN={before_lsn} == 撤销 LSN {rec.lsn} "
-                    "→ 页 LSN 条件满足，逆序沿 prevLSN 链回写 before"
-                ),
-                "decision": (
-                    f"撤销 [{rec.offset},{rec.offset + rec.length})：after→before，"
-                    f"pageLSN {before_lsn}→{rec.prev_lsn}，下一跳 {rec.prev_lsn}"
-                ),
+                "criterion": criterion,
+                "decision": decision,
                 "pageLSNBefore": before_lsn,
                 "pageLSNAfter": st.page_lsn,
-                "changed": True,
+                "changed": changed,
                 "offset": rec.offset,
                 "length": rec.length,
+                "restoredBytes": len(restore),
+                "committedBytesKept": kept,
+                "alreadyBeforeBytes": idempotent,
             }
         )
-        undo_stack.append(rec.prev_lsn)
-        undo_stack.sort(reverse=True)
+        if next_hop is not None:
+            undo_stack.append(next_hop)
+            undo_stack.sort(reverse=True)
 
     # ================= frozen verdict ====================================
+    # The scalar pageLSN carried through undo follows the loser chain; make
+    # sure it never understates a committed update that materially survives
+    # on the final page image (interleaved winner writes on the same page),
+    # and keep the last per-page undo evidence in lock-step with the frozen
+    # summary.
+    last_undo_row_by_page: dict[int, int] = {}
+    for i, row in enumerate(trace):
+        if row["phase"] == "undo" and row.get("page") is not None:
+            last_undo_row_by_page[row["page"]] = i
+
+    for st in pages.values():
+        reconciled = st.page_lsn
+        for rec in winner_by_page.get(st.page_no, ()):
+            lo, hi = rec.offset, rec.offset + rec.length
+            if bytes(st.data[lo:hi]) == rec.after:
+                if reconciled is None or rec.lsn > reconciled:
+                    reconciled = rec.lsn
+        if reconciled != st.page_lsn:
+            st.page_lsn = reconciled
+            idx = last_undo_row_by_page.get(st.page_no)
+            if idx is not None:
+                trace[idx]["pageLSNAfter"] = reconciled
+                trace[idx]["decision"] += (
+                    f"；冻结 pageLSN={reconciled}（同页已提交更新仍可见，"
+                    "不得沿失败事务链回退）"
+                )
+
     page_summary = []
     for pno in sorted(pages):
         st = pages[pno]
